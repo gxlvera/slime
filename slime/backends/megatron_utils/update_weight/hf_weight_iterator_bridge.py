@@ -4,6 +4,7 @@ from slime.utils import megatron_bridge_utils
 from slime.utils.misc import chunk_named_params_by_size
 
 from ..megatron_to_hf import postprocess_hf_param
+from ..megatron_to_hf.processors import quantize_params
 from ..misc_utils import strip_param_name_prefix
 from .hf_weight_iterator_base import HfWeightIteratorBase
 
@@ -19,33 +20,59 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         self._bridge = AutoBridge.from_hf_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
 
     def get_hf_weight_chunks(self, megatron_local_weights):
-        # TODO support quantization (e.g. modify megatron-bridge to provide megatron param name)
+        # Supports quantization by post-processing weights using slime's quantizers.
         renamed_megatron_local_weights = {strip_param_name_prefix(k): v for k, v in megatron_local_weights.items()}
         with megatron_bridge_utils.patch_megatron_model(self.model):
             conversion_tasks = self._bridge.get_conversion_tasks(self.model)
             conversion_tasks = _process_conversion_tasks(conversion_tasks, renamed_megatron_local_weights)
 
-            named_weights = self._bridge.export_hf_weights(self.model, cpu=False, conversion_tasks=conversion_tasks)
-
-            base_named_weights = named_weights
+            raw_named_weights = self._bridge.export_hf_weights(
+                self.model,
+                cpu=False,
+                conversion_tasks=conversion_tasks,
+                merge_adapter_weights=True,
+                include_megatron_param_name=True,
+            )
 
             def _iter_named_weights():
-                for item in base_named_weights:
+                for item in raw_named_weights:
+                    megatron_param_name = None
                     if len(item) == 3:
                         hf_param_name, weight, megatron_param_name = item
+                    elif len(item) == 2:
+                        hf_param_name, weight = item
+                    else:
+                        raise ValueError(f"Unexpected weight tuple size: {len(item)} for {item}")
+                    if megatron_param_name is not None:
                         weight = postprocess_hf_param(
                             args=self.args,
                             megatron_param_name=megatron_param_name,
                             hf_param_name=hf_param_name,
                             param=weight,
                         )
-                    elif len(item) == 2:
-                        hf_param_name, weight = item
-                    else:
-                        raise ValueError(f"Unexpected weight tuple size: {len(item)} for {item}")
-                    yield (hf_param_name, weight)
+                    yield (hf_param_name, weight, megatron_param_name)
 
-            named_weights = _iter_named_weights()
+            base_named_weights = _iter_named_weights()
+
+            if self.quantization_config:
+                def _iter_quantized(source_iter):
+                    for hf_param_name, weight, megatron_param_name in source_iter:
+                        if megatron_param_name is None:
+                            # No megatron name - skip quantization heuristics.
+                            yield (hf_param_name, weight)
+                            continue
+                        quantized = quantize_params(
+                            self.args,
+                            megatron_param_name,
+                            [(hf_param_name, weight)],
+                            self.quantization_config,
+                        )
+                        for q_name, q_weight in quantized:
+                            yield (q_name, q_weight)
+
+                named_weights = _iter_quantized(base_named_weights)
+            else:
+                named_weights = ((name, weight) for name, weight, _ in base_named_weights)
 
             yield from chunk_named_params_by_size(named_weights, chunk_size=self.args.update_weight_buffer_size)
 

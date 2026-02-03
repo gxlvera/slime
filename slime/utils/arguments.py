@@ -1560,6 +1560,32 @@ def slime_validate_args(args):
     if args.megatron_to_hf_mode == "bridge":
         if args.load is None:
             args.load = args.ref_load or args.hf_checkpoint
+
+            # If hf_checkpoint is int4 (compressed-tensors), try a BF16 sibling path for Megatron load.
+            # This keeps hf_checkpoint for rollout/tokenizer while loading FP weights into Megatron.
+            try:
+                if args.hf_checkpoint and os.path.isdir(args.hf_checkpoint):
+                    hf_cfg = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
+                    quant_cfg = getattr(hf_cfg, "quantization_config", None)
+                    if quant_cfg and quant_cfg.get("quant_method") == "compressed-tensors":
+                        candidates = []
+                        for suffix in ("-INT4", "_INT4", "-int4", "_int4"):
+                            if args.hf_checkpoint.endswith(suffix):
+                                candidates.append(args.hf_checkpoint[: -len(suffix)])
+                        # Also try removing a trailing "/INT4" style if present
+                        if args.hf_checkpoint.endswith("/INT4"):
+                            candidates.append(args.hf_checkpoint[: -len("/INT4")])
+                        for cand in candidates:
+                            if cand and os.path.isdir(cand):
+                                logger.info(
+                                    "Detected INT4 hf_checkpoint; using BF16 path for Megatron load: %s",
+                                    cand,
+                                )
+                                args.load = cand
+                                break
+            except Exception as exc:
+                logger.warning("Failed to resolve BF16 load path from INT4 hf_checkpoint: %s", exc)
+
         args.start_rollout_id = 0
     else:
         if (

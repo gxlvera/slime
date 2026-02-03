@@ -21,8 +21,6 @@ source "${SCRIPT_DIR}/../../scripts/models/moonlight.sh"
 # Common args
 CKPT_ARGS=(
    --hf-checkpoint /root/Kimi-VL-A3B-Thinking-2506-INT4
-   # --ref-load /xxxxx/Kimi-VL-A3B-Thinking-2506_dist
-   --load /root/Kimi-VL-A3B-Thinking-2506
    --rotary-base 800000
 )
 

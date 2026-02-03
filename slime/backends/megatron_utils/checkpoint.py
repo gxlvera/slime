@@ -135,7 +135,9 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
     logger.info(f"Load checkpoint from HuggingFace model into Megatron (path={load_path})")
 
     with megatron_bridge_utils.patch_megatron_model(ddp_model):
-        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
+        # Use the resolved load_path for Megatron weights. hf_checkpoint is still used
+        # elsewhere (tokenizer/rollout), but weights should come from load_path.
+        bridge = AutoBridge.from_hf_pretrained(load_path, trust_remote_code=True)
         bridge.load_hf_weights(ddp_model)
 
     # Copied from Megatron-core :: load_checkpoint (with simplifications)
