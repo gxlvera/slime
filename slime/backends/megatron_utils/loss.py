@@ -3,7 +3,7 @@ from collections.abc import Callable, Iterator
 from typing import Any
 
 import torch
-from megatron.core import mpu
+from megatron.core import mpu, tensor_parallel
 from torch.utils.checkpoint import checkpoint
 
 from slime.utils.distributed_utils import distributed_masked_whiten
@@ -62,6 +62,8 @@ def get_responses(
     if qkv_format == "thd":
         assert logits.size(0) == 1, f"{logits.shape}"
         logits = logits.squeeze(0)
+        if mpu.get_tensor_model_parallel_world_size() > 1:
+            logits = tensor_parallel.gather_from_sequence_parallel_region(logits)
     else:
         assert max_seq_lens is not None
         logits = logits.view(-1, logits.size(-1))
