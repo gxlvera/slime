@@ -108,6 +108,7 @@ ROTARY_BASE=${SLIME_SCRIPT_ROTARY_BASE:-"5000000"}
 CKPT_ARGS=(
    --hf-checkpoint "${HF_CHECKPOINT}"
    # qwen3 vl model has rotary base 5000000, set it when applicable
+   --ref-load /root/Kimi-VL-A3B-Thinking-2506_torch_dist
    --rotary-base "${ROTARY_BASE}"
 )
 
@@ -119,11 +120,11 @@ ROLLOUT_ARGS=(
    --rollout-shuffle
    --rm-type math
    --num-rollout 3000
-   --rollout-batch-size 8
+   --rollout-batch-size 4
    --n-samples-per-prompt 8
-   --rollout-max-response-len 4096
+   --rollout-max-response-len 3000
    --rollout-temperature 0.8
-   --global-batch-size 64
+   --global-batch-size 32
 )
 
 # required for vlm datasets
@@ -210,7 +211,7 @@ else
    BACKEND_ARGS=(
       --train-backend megatron
       --load "${MEGATRON_LOAD_PATH}"
-      --tensor-model-parallel-size 4
+      --tensor-model-parallel-size 1
       --sequence-parallel
       --pipeline-model-parallel-size 1
       --context-parallel-size 1
@@ -220,7 +221,7 @@ else
       --recompute-method uniform
       --recompute-num-layers 1
       --use-dynamic-batch-size
-      --max-tokens-per-gpu 4096
+      --max-tokens-per-gpu 3000
       --attention-dropout 0.0
       --hidden-dropout 0.0
       --accumulate-allreduce-grads-in-fp32

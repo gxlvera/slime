@@ -15,14 +15,13 @@ pkill -9 python
 set -ex
 export PYTHONBUFFERED=16
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-source "${SCRIPT_DIR}/../../scripts/models/moonlight.sh"
+
+source "/root/slime/scripts/models/moonlight.sh"
 
 # Common args
 CKPT_ARGS=(
-   --hf-checkpoint /root/Kimi-VL-A3B-Thinking-2506-INT4
-   # --ref-load /xxxxx/Kimi-VL-A3B-Thinking-2506_dist
-   --load /root/Kimi-VL-A3B-Thinking-2506
+   --hf-checkpoint /root/Kimi-VL-A3B-Thinking-2506
+   --ref-load /root/Kimi-VL-A3B-Thinking-2506_torch_dist
    --rotary-base 800000
 )
 
@@ -75,7 +74,7 @@ SGLANG_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group k-vl-A3B-thinking-int4-ji
+   --wandb-group k-vl-A3B-thinking-ji
    --wandb-key ${WANDB_KEY}
 )
 
@@ -113,9 +112,7 @@ RUNTIME_ENV_JSON="{
   \"env_vars\": {
     \"PYTHONPATH\": \"/root/Megatron-Bridge/src:/root/Megatron-LM/\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
-    \"OPEN_TRAINING_INT4_FAKE_QAT_FLAG\": \"1\",
-    \"OPEN_TRAINING_INT4_GROUP_SIZE\": \"128\"
+    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
   }
 }"
 
