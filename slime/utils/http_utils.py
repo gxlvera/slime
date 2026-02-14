@@ -162,12 +162,12 @@ def _next_actor():
     return actor
 
 
-async def _post(client, url, payload, max_retries=60):
+async def _post(client, url, payload, max_retries=60, headers=None):
     retry_count = 0
     while retry_count < max_retries:
         response = None
         try:
-            response = await client.post(url, json=payload or {})
+            response = await client.post(url, json=payload or {}, headers=headers)
             response.raise_for_status()
             content = await response.aread()
             try:
@@ -270,7 +270,7 @@ def _init_ray_distributed_post(args):
     _post_actors = created
 
 
-async def post(url, payload, max_retries=60):
+async def post(url, payload, max_retries=60, headers=None):
     # If distributed mode is enabled and actors exist, dispatch via Ray.
     if _distributed_post_enabled and _post_actors:
         try:
@@ -285,7 +285,7 @@ async def post(url, payload, max_retries=60):
             logger.info(f"[http_utils] Distributed POST failed, falling back to local: {e} (url={url})")
             # fall through to local
 
-    return await _post(_http_client, url, payload, max_retries)
+    return await _post(_http_client, url, payload, max_retries, headers=headers)
 
 
 async def get(url):
