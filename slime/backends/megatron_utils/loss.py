@@ -2,6 +2,10 @@ from argparse import Namespace
 from collections.abc import Callable, Iterator
 from typing import Any
 
+import json
+import logging
+import os
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -29,6 +33,23 @@ from .cp_utils import (
     get_sum_of_sample_mean,
     slice_log_prob_with_cp,
 )
+
+logger = logging.getLogger(__name__)
+
+_MEGATRON_VERSION = os.environ.get("MEGATRON_VERSION")
+if not _MEGATRON_VERSION:
+    try:
+        import megatron.core as _megatron_core
+
+        _MEGATRON_VERSION = getattr(_megatron_core, "__version__", "unknown")
+    except Exception:
+        _MEGATRON_VERSION = "unknown"
+
+_ROLLOUT_LOG_DIR = "/root/slime/examples/geo3k_vlm_multi_turn/batch_compare_outputs/check_against_wandb"
+_ROLLOUT_LOG_PATH = os.path.join(
+    _ROLLOUT_LOG_DIR, f"rollout_log_prob_in_loss_{_MEGATRON_VERSION}.log"
+)
+_ROLLOUT_LOG_STEP = 0
 
 
 def get_responses(
@@ -641,7 +662,43 @@ def policy_loss_function(
         are enabled.
     """
     advantages = torch.cat(batch["advantages"], dim=0)
+    global _ROLLOUT_LOG_STEP
     old_log_probs = batch["rollout_log_probs"] if args.use_rollout_logprobs else batch["log_probs"]
+
+    # Log per-sample old_log_probs and loss masks (before concatenation)
+    log_rank0 = True
+    try:
+        if dist.is_available() and dist.is_initialized():
+            log_rank0 = dist.get_rank() == 0
+    except Exception:
+        log_rank0 = True
+    if log_rank0:
+        os.makedirs(_ROLLOUT_LOG_DIR, exist_ok=True)
+        sample_indices = batch.get("sample_indices", None)
+        try:
+            with open(_ROLLOUT_LOG_PATH, "a", encoding="utf-8") as f:
+                for i, (lp, lm) in enumerate(zip(old_log_probs, batch["loss_masks"], strict=False)):
+                    lm_sum = torch.clamp_min(lm.sum(), 1)
+                    avg_lp = (lp * lm).sum() / lm_sum
+                    lp_head = lp[:10]
+                    lm_head = lm[:10]
+                    f.write(
+                        json.dumps(
+                            {
+                                "step": _ROLLOUT_LOG_STEP,
+                                "kind": "old_log_probs_per_sample",
+                                "sample_pos": i,
+                                "sample_index": int(sample_indices[i]) if sample_indices is not None else None,
+                                "old_log_probs": lp_head.detach().float().cpu().tolist(),
+                                "loss_mask": lm_head.detach().float().cpu().tolist(),
+                                "masked_avg_log_prob": float(avg_lp.detach().cpu()),
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+        except Exception as e:
+            logger.warning("Failed to write per-sample old_log_probs log: %s", e)
 
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
@@ -796,6 +853,33 @@ def policy_loss_function(
     if "rollout_log_probs" in batch and batch["rollout_log_probs"]:
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
         train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
+
+        # Log old_log_probs and train_rollout_logprob_abs_diff per batch
+        log_rank0 = True
+        try:
+            if dist.is_available() and dist.is_initialized():
+                log_rank0 = dist.get_rank() == 0
+        except Exception:
+            log_rank0 = True
+        if log_rank0:
+            os.makedirs(_ROLLOUT_LOG_DIR, exist_ok=True)
+            try:
+                with open(_ROLLOUT_LOG_PATH, "a", encoding="utf-8") as f:
+                    f.write(
+                        json.dumps(
+                            {
+                                "step": _ROLLOUT_LOG_STEP,
+                                "train_rollout_logprob_abs_diff": float(
+                                    train_rollout_logprob_abs_diff.detach().cpu()
+                                ),
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+            except Exception as e:
+                logger.warning("Failed to write rollout logprob log: %s", e)
+            _ROLLOUT_LOG_STEP += 1
 
     reported_loss = {
         "loss": loss.clone().detach(),

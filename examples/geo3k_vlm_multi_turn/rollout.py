@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import json
+import os
+import fcntl
 import sys
 from pathlib import Path
 from typing import Any
@@ -16,6 +19,9 @@ from slime.utils.processing_utils import encode_image_for_rollout_engine
 from slime.utils.types import Sample
 
 DEFAULT_ENV_MODULE = "examples.vlm_multi_turn.env_geo3k"
+ROLLOUT_LOG_PATH = "/root/slime/examples/geo3k_vlm_multi_turn/batch_compare_outputs/sglang_rollout_logged.jsonl"
+_ROLLOUT_LOG_INITIALIZED = False
+_CACHED_LOGGED_SAMPLES = None
 
 # Dummy messages used for calculating trim length in chat template encoding
 DUMMY_MESSAGES = [
@@ -306,9 +312,100 @@ def _finalize_sample(sample: Sample, tokenizer, response_tokens, multimodal_trai
     return sample
 
 
+def _load_logged_samples():
+    global _CACHED_LOGGED_SAMPLES
+    if _CACHED_LOGGED_SAMPLES is not None:
+        return _CACHED_LOGGED_SAMPLES
+    if not os.path.exists(ROLLOUT_LOG_PATH):
+        _CACHED_LOGGED_SAMPLES = {}
+        return _CACHED_LOGGED_SAMPLES
+    samples = {}
+    with open(ROLLOUT_LOG_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            samples[int(row["index"])] = row
+    _CACHED_LOGGED_SAMPLES = samples
+    return _CACHED_LOGGED_SAMPLES
+
+
+def _load_sample_from_logged(sample: Sample, tokenizer):
+    cached = _load_logged_samples()
+    if sample.index is None or sample.index not in cached:
+        return None
+    row = cached[sample.index]
+    sample.tokens = row["tokens"]
+    sample.loss_mask = row["loss_mask"]
+    sample.rollout_log_probs = row["rollout_log_probs"]
+    sample.response = row.get("response") or tokenizer.decode(
+        sample.tokens[-row["response_length"] :], skip_special_tokens=False
+    )
+    sample.response_length = row["response_length"]
+    mm_path = row.get("multimodal_train_inputs_path")
+    if not mm_path or not os.path.exists(mm_path):
+        raise RuntimeError(
+            f"Cached sample index={sample.index} missing multimodal_train_inputs_path "
+            f"or file not found: {mm_path}"
+        )
+    try:
+        sample.multimodal_train_inputs = torch.load(mm_path, map_location="cpu")
+    except Exception as e:
+        raise RuntimeError(f"Failed to load multimodal_train_inputs for index={sample.index}: {e}")
+    sample.status = Sample.Status.COMPLETED
+    return sample
+
+
+def _append_rollout_log(sample: Sample):
+    global _ROLLOUT_LOG_INITIALIZED
+    os.makedirs(os.path.dirname(ROLLOUT_LOG_PATH), exist_ok=True)
+    if os.environ.get("SLIME_ROLLOUT_LOG_RESET", "0") == "1" and not _ROLLOUT_LOG_INITIALIZED:
+        with open(ROLLOUT_LOG_PATH, "w", encoding="utf-8") as f:
+            f.write("")
+        _ROLLOUT_LOG_INITIALIZED = True
+
+    mm_path = None
+    if sample.multimodal_train_inputs is not None:
+        mm_dir = os.path.join(os.path.dirname(ROLLOUT_LOG_PATH), "mm_cache")
+        os.makedirs(mm_dir, exist_ok=True)
+        mm_path = os.path.join(mm_dir, f"mm_inputs_{sample.index:03d}.pt")
+        try:
+            torch.save(sample.multimodal_train_inputs, mm_path)
+        except Exception:
+            mm_path = None
+
+    payload = {
+        "index": sample.index,
+        "prompt": sample.prompt,
+        "label": sample.label,
+        "tokens": sample.tokens,
+        "loss_mask": sample.loss_mask,
+        "rollout_log_probs": sample.rollout_log_probs,
+        "response": sample.response,
+        "response_length": sample.response_length,
+        "multimodal_train_inputs_path": mm_path,
+    }
+    with open(ROLLOUT_LOG_PATH, "a", encoding="utf-8") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX)
+        except Exception:
+            pass
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        try:
+            fcntl.flock(f, fcntl.LOCK_UN)
+        except Exception:
+            pass
+
+
 async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
     """Custom multi-turn rollout that interacts with a pluggable environment."""
     assert not args.partial_rollout, "Partial rollout is not supported for interaction rollouts."
+
+    state = GenerateState(args)
+    cached_sample = _load_sample_from_logged(sample, state.tokenizer)
+    if cached_sample is not None:
+        return cached_sample
 
     env, env_module, config, state, url = _initialize_resources(args, sample)
     sampling_params = sampling_params.copy()
@@ -365,7 +462,9 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
                 sample.status = Sample.Status.COMPLETED
                 break
 
-        return _finalize_sample(sample, state.tokenizer, response_tokens, multimodal_train_inputs_buffer)
+        sample = _finalize_sample(sample, state.tokenizer, response_tokens, multimodal_train_inputs_buffer)
+        _append_rollout_log(sample)
+        return sample
     finally:
         try:
             env.close()
