@@ -36,20 +36,22 @@ from .cp_utils import (
 
 logger = logging.getLogger(__name__)
 
-_MEGATRON_VERSION = os.environ.get("MEGATRON_VERSION")
-if not _MEGATRON_VERSION:
+_MODE = os.environ.get("MODE")
+if not _MODE:
     try:
         import megatron.core as _megatron_core
 
-        _MEGATRON_VERSION = getattr(_megatron_core, "__version__", "unknown")
+        _MODE = getattr(_megatron_core, "__version__", "unknown")
     except Exception:
-        _MEGATRON_VERSION = "unknown"
+        _MODE = "unknown"
 
 _ROLLOUT_LOG_DIR = "/root/slime/examples/geo3k_vlm_multi_turn/batch_compare_outputs/check_against_wandb"
 _ROLLOUT_LOG_PATH = os.path.join(
-    _ROLLOUT_LOG_DIR, f"rollout_log_prob_in_loss_{_MEGATRON_VERSION}.log"
+    _ROLLOUT_LOG_DIR, f"rollout_log_prob_in_loss_{_MODE}.log"
 )
 _ROLLOUT_LOG_STEP = 0
+_TOKENIZER = None
+_TOKENIZER_PATH = None
 
 
 def get_responses(
@@ -675,13 +677,41 @@ def policy_loss_function(
     if log_rank0:
         os.makedirs(_ROLLOUT_LOG_DIR, exist_ok=True)
         sample_indices = batch.get("sample_indices", None)
+        unconcat_tokens = batch.get("unconcat_tokens", None)
+        response_lengths = batch.get("response_lengths", None)
+        tokenizer = None
+        tokenizer_path = getattr(args, "hf_checkpoint", None) or getattr(args, "load", None)
+        if tokenizer_path:
+            global _TOKENIZER, _TOKENIZER_PATH
+            if _TOKENIZER is None or _TOKENIZER_PATH != tokenizer_path:
+                try:
+                    from transformers import AutoTokenizer
+
+                    _TOKENIZER = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+                    _TOKENIZER_PATH = tokenizer_path
+                except Exception as e:
+                    logger.warning("Failed to load tokenizer for logging: %s", e)
+            tokenizer = _TOKENIZER
         try:
             with open(_ROLLOUT_LOG_PATH, "a", encoding="utf-8") as f:
                 for i, (lp, lm) in enumerate(zip(old_log_probs, batch["loss_masks"], strict=False)):
                     lm_sum = torch.clamp_min(lm.sum(), 1)
                     avg_lp = (lp * lm).sum() / lm_sum
-                    lp_head = lp[:10]
-                    lm_head = lm[:10]
+                    head_n = min(10, lp.numel())
+                    lp_head = lp[:head_n]
+                    lm_head = lm[:head_n]
+                    resp_len = int(response_lengths[i]) if response_lengths is not None else None
+                    token_ids_head = None
+                    token_text_head = None
+                    if unconcat_tokens is not None and response_lengths is not None:
+                        full_tokens = unconcat_tokens[i]
+                        resp_tokens = full_tokens[-resp_len:] if resp_len is not None else full_tokens
+                        resp_head = resp_tokens[:head_n].detach().cpu().tolist()
+                        token_ids_head = resp_head
+                        if tokenizer is not None:
+                            token_text_head = [
+                                tokenizer.decode([tid], skip_special_tokens=False) for tid in resp_head
+                            ]
                     f.write(
                         json.dumps(
                             {
@@ -689,9 +719,12 @@ def policy_loss_function(
                                 "kind": "old_log_probs_per_sample",
                                 "sample_pos": i,
                                 "sample_index": int(sample_indices[i]) if sample_indices is not None else None,
+                                "response_length": resp_len,
                                 "old_log_probs": lp_head.detach().float().cpu().tolist(),
                                 "loss_mask": lm_head.detach().float().cpu().tolist(),
                                 "masked_avg_log_prob": float(avg_lp.detach().cpu()),
+                                "token_ids": token_ids_head,
+                                "token_text": token_text_head,
                             },
                             ensure_ascii=False,
                         )
