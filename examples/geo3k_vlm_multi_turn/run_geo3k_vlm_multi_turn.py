@@ -44,6 +44,7 @@ def execute():
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME} "
     mode = os.environ.get("MODE", "").lower()
     qkv_format = "bshd" if mode.endswith("bshd") else "thd"
+    sequence_parallel_arg = "--sequence-parallel " if "sp" in mode else ""
 
     wandb_args = (
         (
@@ -66,7 +67,7 @@ def execute():
         "--custom-generate-function-path examples.geo3k_vlm_multi_turn.rollout.generate "
         "--custom-config-path examples/geo3k_vlm_multi_turn/geo3k_vlm_multi_turn_config.yaml "
         "--rollout-shuffle "
-        "--num-rollout 8 "
+        "--num-rollout 4 "
         "--rollout-batch-size 1 "
         "--n-samples-per-prompt 1 "
         "--rollout-max-response-len 4096 "
@@ -113,7 +114,7 @@ def execute():
         "--train-backend megatron "
         f"--load /root/models/{MODEL_NAME} "
         "--tensor-model-parallel-size 4 "
-        "--sequence-parallel "
+        f"{sequence_parallel_arg}"
         "--pipeline-model-parallel-size 1 "
         "--context-parallel-size 1 "
         "--expert-model-parallel-size 1 "
