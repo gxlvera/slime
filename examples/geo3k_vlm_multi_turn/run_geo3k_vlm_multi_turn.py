@@ -22,6 +22,7 @@ DATASET_NAME = "VeraIsHere/geo3k_imgurl_processed"
 DATA_ROOT = "/root/datasets/geo3k_imgurl_processed"
 TRAIN_DATA_PATH = os.path.join(DATA_ROOT, "train.parquet")
 
+MODE = os.environ.get("MODE")
 
 def get_megatron_model_type(model_name: str) -> str:
     model_type = model_name.replace("-Instruct", "").replace("-Thinking", "")
@@ -41,12 +42,14 @@ def prepare():
 
 def execute():
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME} "
+    mode = os.environ.get("MODE", "").lower()
+    qkv_format = "bshd" if mode.endswith("bshd") else "thd"
 
     wandb_args = (
         (
             "--use-wandb "
             "--wandb-project slime-dev "
-            "--wandb-group geo3k_vlm_multi_turn "
+            f"--wandb-group geo3k_vlm_multi_turn_{MODE} "
             f"--wandb-key '{wandb_api_key}' "
         )
         if (wandb_api_key := os.environ.get("WANDB_API_KEY"))
@@ -63,12 +66,13 @@ def execute():
         "--custom-generate-function-path examples.geo3k_vlm_multi_turn.rollout.generate "
         "--custom-config-path examples/geo3k_vlm_multi_turn/geo3k_vlm_multi_turn_config.yaml "
         "--rollout-shuffle "
-        "--num-rollout 3000 "
-        "--rollout-batch-size 64 "
-        "--n-samples-per-prompt 8 "
+        "--num-rollout 8 "
+        "--rollout-batch-size 1 "
+        "--n-samples-per-prompt 1 "
         "--rollout-max-response-len 4096 "
         "--rollout-temperature 1 "
-        "--global-batch-size 512 "
+        "--global-batch-size 1 "
+        "--micro-batch-size 1 "
     )
 
     # eval_args = (
@@ -117,7 +121,6 @@ def execute():
         "--recompute-granularity full "
         "--recompute-method uniform "
         "--recompute-num-layers 1 "
-        "--use-dynamic-batch-size "
         "--max-tokens-per-gpu 4096 "
         "--attention-dropout 0.0 "
         "--hidden-dropout 0.0 "
@@ -125,6 +128,7 @@ def execute():
         "--attention-softmax-in-fp32 "
         "--attention-backend flash "
         "--megatron-to-hf-mode bridge "
+        f"--qkv-format {qkv_format} "
     )
 
     misc_args = (
@@ -147,6 +151,7 @@ def execute():
         f"{wandb_args} "
         # f"{get_default_wandb_args(__file__)} "
     )
+    print(train_args, flush=True)
 
     execute_train(
         train_args=train_args,

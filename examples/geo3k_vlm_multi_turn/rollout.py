@@ -22,6 +22,8 @@ DEFAULT_ENV_MODULE = "examples.vlm_multi_turn.env_geo3k"
 ROLLOUT_LOG_PATH = "/root/slime/examples/geo3k_vlm_multi_turn/batch_compare_outputs/sglang_rollout_logged.jsonl"
 _ROLLOUT_LOG_INITIALIZED = False
 _CACHED_LOGGED_SAMPLES = None
+_MODE = os.environ.get("MODE", "")
+_DROP_MM_TRAIN_INPUTS = "m0" in _MODE
 
 # Dummy messages used for calculating trim length in chat template encoding
 DUMMY_MESSAGES = [
@@ -305,6 +307,8 @@ def _update_budget(budget, consumed: int):
 
 def _finalize_sample(sample: Sample, tokenizer, response_tokens, multimodal_train_inputs_buffer):
     sample.multimodal_train_inputs = _merge_multimodal_train_inputs(multimodal_train_inputs_buffer)
+    if _DROP_MM_TRAIN_INPUTS:
+        sample.multimodal_train_inputs = None
     sample.response = tokenizer.decode(response_tokens, skip_special_tokens=False)
     sample.response_length = len(response_tokens)
     if sample.status is None:
@@ -343,16 +347,19 @@ def _load_sample_from_logged(sample: Sample, tokenizer):
         sample.tokens[-row["response_length"] :], skip_special_tokens=False
     )
     sample.response_length = row["response_length"]
-    mm_path = row.get("multimodal_train_inputs_path")
-    if not mm_path or not os.path.exists(mm_path):
-        raise RuntimeError(
-            f"Cached sample index={sample.index} missing multimodal_train_inputs_path "
-            f"or file not found: {mm_path}"
-        )
-    try:
-        sample.multimodal_train_inputs = torch.load(mm_path, map_location="cpu")
-    except Exception as e:
-        raise RuntimeError(f"Failed to load multimodal_train_inputs for index={sample.index}: {e}")
+    if _DROP_MM_TRAIN_INPUTS:
+        sample.multimodal_train_inputs = None
+    else:
+        mm_path = row.get("multimodal_train_inputs_path")
+        if not mm_path or not os.path.exists(mm_path):
+            raise RuntimeError(
+                f"Cached sample index={sample.index} missing multimodal_train_inputs_path "
+                f"or file not found: {mm_path}"
+            )
+        try:
+            sample.multimodal_train_inputs = torch.load(mm_path, map_location="cpu")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load multimodal_train_inputs for index={sample.index}: {e}")
     sample.status = Sample.Status.COMPLETED
     return sample
 
@@ -366,7 +373,7 @@ def _append_rollout_log(sample: Sample):
         _ROLLOUT_LOG_INITIALIZED = True
 
     mm_path = None
-    if sample.multimodal_train_inputs is not None:
+    if sample.multimodal_train_inputs is not None and not _DROP_MM_TRAIN_INPUTS:
         mm_dir = os.path.join(os.path.dirname(ROLLOUT_LOG_PATH), "mm_cache")
         os.makedirs(mm_dir, exist_ok=True)
         mm_path = os.path.join(mm_dir, f"mm_inputs_{sample.index:03d}.pt")
