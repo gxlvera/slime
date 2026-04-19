@@ -403,7 +403,7 @@ class MegatronTrainRayActor(TrainRayActor):
             num_microbatches,
         )
 
-    def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
+    def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> dict[str, float]:
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
 
@@ -480,7 +480,7 @@ class MegatronTrainRayActor(TrainRayActor):
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
             with timer("actor_train"):
-                train(
+                train_summary = train(
                     rollout_id,
                     self.model,
                     self.optimizer,
@@ -495,6 +495,10 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.use_routing_replay:
             RoutingReplay.clear_all()
+
+        if train_summary.get("train/rollout_rejected_by_logprob_diff", 0):
+            log_perf_data(rollout_id, self.args)
+            return train_summary
 
         # update the cpu actor weight to the latest model
         self.weights_backuper.backup("actor")
@@ -511,6 +515,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.weights_backuper.backup("ref")
 
         log_perf_data(rollout_id, self.args)
+        return train_summary
 
     @timer
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:

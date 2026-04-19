@@ -307,7 +307,7 @@ def train_one_step(
     optimizer: MegatronOptimizer,
     opt_param_scheduler: OptimizerParamScheduler,
     num_microbatches: int,
-) -> tuple[dict[str, float], float]:
+) -> tuple[dict[str, float], float, bool]:
     """Execute a single pipeline-parallel training step.
 
     Runs forward/backward over ``num_microbatches``, applies optimizer step and
@@ -431,9 +431,52 @@ def train_one_step(
         forward_only=False,
     )
 
+    loss_reduced = {}
+    rejected_by_logprob_diff = False
+    if mpu.is_pipeline_last_stage(ignore_virtual=True):
+        # Average loss across microbatches before the optimizer step so a
+        # rejection decision can reuse the exact scalar that is otherwise
+        # logged to W&B.
+        keys = losses_reduced[0]["keys"]
+        values = None
+        for x in losses_reduced:
+            if values is None:
+                values = x["values"]
+            else:
+                values += x["values"]
+        assert len(keys) + 1 == values.numel()
+        torch.distributed.all_reduce(values, group=mpu.get_data_parallel_group(with_context_parallel=True))
+
+        values = values.tolist()
+        num_samples_or_tokens = values[0]
+        for key, value in zip(keys, values[1:], strict=False):
+            loss_reduced[key] = value * mpu.get_context_parallel_world_size() / num_samples_or_tokens
+
+        role = getattr(model[0], "role", "actor")
+        reject_threshold = getattr(args, "update_weights_logprob_diff_reject_threshold", None)
+        if (
+            role == "actor"
+            and reject_threshold is not None
+            and "train_rollout_logprob_abs_diff" in loss_reduced
+            and loss_reduced["train_rollout_logprob_abs_diff"] > reject_threshold
+        ):
+            rejected_by_logprob_diff = True
+
+    reject_tensor = torch.tensor(
+        int(rejected_by_logprob_diff),
+        device=torch.cuda.current_device(),
+        dtype=torch.int,
+    )
+    torch.distributed.broadcast(
+        reject_tensor,
+        src=mpu.get_pipeline_model_parallel_last_rank(),
+        group=mpu.get_pipeline_model_parallel_group(),
+    )
+    rejected_by_logprob_diff = bool(reject_tensor.item())
+
     valid_step = True
     grad_norm = float("nan")
-    if not getattr(args, "check_for_nan_in_loss_and_grad", True):
+    if not rejected_by_logprob_diff and not getattr(args, "check_for_nan_in_loss_and_grad", True):
         found_inf_flag = optimizer.prepare_grads()
         if found_inf_flag:
             valid_step = False
@@ -446,12 +489,12 @@ def train_one_step(
 
     # CI check: verify only MTP parameters have non-zero gradients when truncation happens
     # This check must happen before optimizer.step() as gradients may be modified during step
-    if args.ci_test and args.enable_mtp_training:
+    if not rejected_by_logprob_diff and args.ci_test and args.enable_mtp_training:
         from slime.backends.megatron_utils.ci_utils import check_mtp_only_grad
 
         check_mtp_only_grad(model, step_id)
 
-    if valid_step:
+    if not rejected_by_logprob_diff and valid_step:
         # Update parameters.
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
@@ -464,25 +507,7 @@ def train_one_step(
         model_chunk.zero_grad_buffer()
     optimizer.zero_grad()
 
-    if mpu.is_pipeline_last_stage(ignore_virtual=True):
-        # Average loss across microbatches.
-        keys = losses_reduced[0]["keys"]
-        values = None
-        for x in losses_reduced:
-            if values is None:
-                values = x["values"]
-            else:
-                values += x["values"]
-        assert len(keys) + 1 == values.numel()
-        torch.distributed.all_reduce(values, group=mpu.get_data_parallel_group(with_context_parallel=True))
-
-        loss_reduced = {}
-        values = values.tolist()
-        num_samples_or_tokens = values[0]
-        for key, value in zip(keys, values[1:], strict=False):
-            loss_reduced[key] = value * mpu.get_context_parallel_world_size() / num_samples_or_tokens
-        return loss_reduced, grad_norm
-    return {}, grad_norm
+    return loss_reduced, grad_norm, rejected_by_logprob_diff
 
 
 def should_disable_forward_pre_hook(args: Namespace) -> bool:
@@ -497,7 +522,7 @@ def train(
     opt_param_scheduler: OptimizerParamScheduler,
     data_iterator: Sequence[DataIterator],
     num_microbatches: Sequence[int],
-) -> None:
+) -> dict[str, float]:
     """Run training over a rollout consisting of multiple steps.
 
     The model is switched to train mode, training hooks are configured, and
@@ -585,12 +610,16 @@ def train(
         pre_hook_enabled = False
 
     num_steps_per_rollout = len(num_microbatches)
+    if args.update_weights_logprob_diff_reject_threshold is not None and num_steps_per_rollout != 1:
+        raise ValueError("--update-weights-logprob-diff-reject-threshold requires exactly one train step per rollout.")
+
+    rollout_summary: dict[str, float] = {}
 
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
 
         # Run training step.
-        loss_dict, grad_norm = train_one_step(
+        loss_dict, grad_norm, rejected_by_logprob_diff = train_one_step(
             args,
             rollout_id,
             step_id,
@@ -609,6 +638,16 @@ def train(
                 enable_forward_pre_hook(model)
                 config.param_sync_func = param_sync_func
                 pre_hook_enabled = True
+
+        if rejected_by_logprob_diff:
+            if mpu.is_pipeline_last_stage(ignore_virtual=True):
+                role = getattr(model[0], "role", "actor")
+                if role == "actor" and "train_rollout_logprob_abs_diff" in loss_dict:
+                    rollout_summary["train/train_rollout_logprob_abs_diff"] = loss_dict[
+                        "train_rollout_logprob_abs_diff"
+                    ]
+                    rollout_summary["train/rollout_rejected_by_logprob_diff"] = 1
+            break
 
         if args.enable_mtp_training:
             from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
@@ -654,6 +693,13 @@ def train(
             log_dict["train/step"] = accumulated_step_id
             logging_utils.log(args, log_dict, step_key="train/step")
 
+            if role == "actor" and "train/train_rollout_logprob_abs_diff" in log_dict:
+                # Reuse the exact scalar that is sent to W&B so the async weight-sync
+                # decision observes the same value as external monitoring.
+                rollout_summary["train/train_rollout_logprob_abs_diff"] = log_dict[
+                    "train/train_rollout_logprob_abs_diff"
+                ]
+
             if args.ci_test and not args.ci_disable_kl_checker:
                 if step_id == 0 and "train/ppo_kl" in log_dict and "train/pg_clipfrac" in log_dict:
                     # TODO: figure out why KL is not exactly zero when using PPO loss with KL clipping, and whether this is expected behavior or a bug.
@@ -686,6 +732,8 @@ def train(
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if pre_hook_enabled:
         disable_forward_pre_hook(model)
+
+    return rollout_summary
 
 
 def save(

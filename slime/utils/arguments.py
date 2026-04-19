@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import math
 import os
 from typing import Any
 
@@ -433,6 +434,56 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=1,
                 help="Interval for updating the weights",
+            )
+            parser.add_argument(
+                "--update-weights-interval-decay-rate",
+                type=float,
+                default=None,
+                help=(
+                    "When set for async training without --update-weights-logprob-diff-threshold, "
+                    "use update_weights_interval for the first two thirds of rollouts and "
+                    "update_weights_interval * decay_rate for the last third."
+                ),
+            )
+            parser.add_argument(
+                "--update-weights-logprob-diff-threshold",
+                type=float,
+                default=None,
+                help=(
+                    "When set, async training will sync rollout weights only when the actor-side "
+                    "W&B-logged train_rollout_logprob_abs_diff exceeds this threshold. "
+                    "This overrides --update-weights-interval for async weight syncing."
+                ),
+            )
+            parser.add_argument(
+                "--update-weights-logprob-diff-reject-threshold",
+                type=float,
+                default=None,
+                help=(
+                    "When set, async actor training rejects a rollout batch before the optimizer step "
+                    "if the actor-side train_rollout_logprob_abs_diff exceeds this threshold. "
+                    "Rejected batches are logged in the staleness namespace and do not count as "
+                    "successful logical rollout steps."
+                ),
+            )
+            parser.add_argument(
+                "--update-weights-logprob-diff-threshold-decay-to",
+                type=float,
+                default=None,
+                help=(
+                    "When set together with --update-weights-logprob-diff-threshold, use the base "
+                    "threshold until --update-weights-logprob-diff-threshold-decay-after-ratio "
+                    "of rollout steps, then use this threshold."
+                ),
+            )
+            parser.add_argument(
+                "--update-weights-logprob-diff-threshold-decay-after-ratio",
+                type=float,
+                default=2 / 3,
+                help=(
+                    "Rollout progress ratio at which --update-weights-logprob-diff-threshold-decay-to "
+                    "takes effect. For example, 0.5 switches halfway and 0.666667 switches for the last third."
+                ),
             )
             parser.add_argument(
                 "--keep-old-actor",
@@ -1497,6 +1548,49 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 def slime_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
 
+    # Backward-compatibility shim for older TIS/MIS helpers that still expect
+    # *_upper_bound / *_lower_bound names instead of the current clip fields.
+    if not hasattr(args, "tis_upper_bound"):
+        args.tis_upper_bound = args.tis_clip
+    if not hasattr(args, "tis_lower_bound"):
+        args.tis_lower_bound = args.tis_clip_low
+    if not hasattr(args, "rs_lower_bound"):
+        args.rs_lower_bound = None
+    if not hasattr(args, "rs_upper_bound"):
+        args.rs_upper_bound = None
+
+    if args.update_weights_interval_decay_rate is not None and args.update_weights_logprob_diff_threshold is None:
+        if args.update_weights_interval_decay_rate <= 0:
+            raise ValueError("--update-weights-interval-decay-rate must be positive.")
+        decayed_interval = args.update_weights_interval * args.update_weights_interval_decay_rate
+        rounded = round(decayed_interval)
+        if rounded < 1 or not math.isclose(decayed_interval, rounded):
+            raise ValueError(
+                f"--update-weights-interval-decay-rate makes the last-third interval {decayed_interval}, "
+                "which is not a positive integer."
+            )
+    if args.update_weights_logprob_diff_threshold_decay_to is not None:
+        if args.update_weights_logprob_diff_threshold is None:
+            raise ValueError(
+                "--update-weights-logprob-diff-threshold-decay-to requires "
+                "--update-weights-logprob-diff-threshold."
+            )
+        if args.update_weights_logprob_diff_threshold_decay_to < 0:
+            raise ValueError("--update-weights-logprob-diff-threshold-decay-to must be non-negative.")
+        if not (0 < args.update_weights_logprob_diff_threshold_decay_after_ratio < 1):
+            raise ValueError("--update-weights-logprob-diff-threshold-decay-after-ratio must be between 0 and 1.")
+    if args.update_weights_logprob_diff_reject_threshold is not None:
+        if args.update_weights_logprob_diff_reject_threshold < 0:
+            raise ValueError("--update-weights-logprob-diff-reject-threshold must be non-negative.")
+        if (
+            args.update_weights_logprob_diff_threshold is not None
+            and args.update_weights_logprob_diff_reject_threshold < args.update_weights_logprob_diff_threshold
+        ):
+            raise ValueError(
+                "--update-weights-logprob-diff-reject-threshold must be greater than or equal to "
+                "--update-weights-logprob-diff-threshold."
+            )
+
     if args.use_slime_router:
         logger.warning(
             "--use-slime-router is deprecated and ignored. slime now always uses sglang_router "
@@ -1623,6 +1717,8 @@ def slime_validate_args(args):
         args.debug_train_only = True
 
     args.use_critic = args.advantage_estimator == "ppo"
+    if args.use_critic and args.update_weights_logprob_diff_reject_threshold is not None:
+        raise ValueError("--update-weights-logprob-diff-reject-threshold is currently supported only without critic.")
     if args.critic_train_only:
         if not args.use_critic:
             raise ValueError("--critic-train-only requires --use-critic (or --advantage-estimator ppo).")

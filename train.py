@@ -1,9 +1,15 @@
+import logging
+import time
+
 import ray
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from slime.utils.arguments import parse_args
-from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking, update_tracking_open_metrics
+from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking, log, update_tracking_open_metrics
+from slime.utils.metric_utils import compute_rollout_step
 from slime.utils.misc import should_run_periodic_action
+
+logger = logging.getLogger(__name__)
 
 
 def train(args):
@@ -36,9 +42,30 @@ def train(args):
     if args.offload_rollout:
         ray.get(rollout_manager.onload_kv.remote())
 
+    train_start_time = time.monotonic()
+    eval_time = 0.0
+
+    def eval_rollout(rollout_id):
+        nonlocal eval_time
+        eval_start_time = time.monotonic()
+        try:
+            return ray.get(rollout_manager.eval.remote(rollout_id))
+        finally:
+            eval_time += time.monotonic() - eval_start_time
+
+    def log_total_training_time():
+        total_training_time = time.monotonic() - train_start_time - eval_time
+        final_rollout_id = args.num_rollout - 1 if args.num_rollout > args.start_rollout_id else args.start_rollout_id
+        log_dict = {
+            "rollout/step": compute_rollout_step(args, final_rollout_id),
+            "perf/total_training_time": max(total_training_time, 0.0),
+        }
+        logger.info(f"perf total training: {log_dict}")
+        log(args, log_dict, step_key="rollout/step")
+
     # special case for eval-only
     if args.num_rollout == 0 and args.eval_interval is not None:
-        ray.get(rollout_manager.eval.remote(rollout_id=0))
+        eval_rollout(rollout_id=0)
 
     def offload_train(rollout_id):
         if args.offload_train:
@@ -72,7 +99,7 @@ def train(args):
     # note that for async training, one can change the position of the sync operation(ray.get).
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         if args.eval_interval is not None and rollout_id == 0 and not args.skip_eval_before_train:
-            ray.get(rollout_manager.eval.remote(rollout_id))
+            eval_rollout(rollout_id)
 
         rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
 
@@ -99,8 +126,9 @@ def train(args):
             ray.get(rollout_manager.onload_kv.remote())
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
-            ray.get(rollout_manager.eval.remote(rollout_id))
+            eval_rollout(rollout_id)
 
+    log_total_training_time()
     ray.get(rollout_manager.dispose.remote())
     finish_tracking(args)
 

@@ -1,10 +1,13 @@
 import logging
 import os
 from copy import deepcopy
+from hashlib import sha1
 
 import wandb
 
 logger = logging.getLogger(__name__)
+
+WANDB_GROUP_MAX_LENGTH = 128
 
 
 def _is_offline_mode(args) -> bool:
@@ -17,6 +20,15 @@ def _is_offline_mode(args) -> bool:
     if args.wandb_mode:
         return args.wandb_mode == "offline"
     return os.environ.get("WANDB_MODE") == "offline"
+
+
+def _truncate_wandb_group(group: str) -> str:
+    if len(group) <= WANDB_GROUP_MAX_LENGTH:
+        return group
+
+    digest = sha1(group.encode("utf-8")).hexdigest()[:8]
+    suffix = f"-{digest}"
+    return f"{group[: WANDB_GROUP_MAX_LENGTH - len(suffix)]}{suffix}"
 
 
 def init_wandb_primary(args):
@@ -48,6 +60,16 @@ def init_wandb_primary(args):
     else:
         group = args.wandb_group
         run_name = args.wandb_group
+
+    truncated_group = _truncate_wandb_group(group)
+    if truncated_group != group:
+        logger.warning(
+            "W&B group name exceeded %d characters and was shortened from %r to %r.",
+            WANDB_GROUP_MAX_LENGTH,
+            group,
+            truncated_group,
+        )
+        group = truncated_group
 
     # Prepare wandb init parameters
     init_kwargs = {
@@ -197,6 +219,8 @@ def _init_wandb_common():
     wandb.define_metric("train/*", step_metric="train/step")
     wandb.define_metric("rollout/step")
     wandb.define_metric("rollout/*", step_metric="rollout/step")
+    wandb.define_metric("staleness/attempt_step")
+    wandb.define_metric("staleness/*", step_metric="staleness/attempt_step")
     wandb.define_metric("multi_turn/*", step_metric="rollout/step")
     wandb.define_metric("passrate/*", step_metric="rollout/step")
     wandb.define_metric("eval/step")
